@@ -1,0 +1,15 @@
+# AWS CodeBuild: test, then package dist/lambda.zip for the Lambda function.
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22
+  build:
+    commands:
+      - npm ci
+      - npm test
+      - ./deploy/build-lambda.sh
+artifacts:
+  files:
+    - dist/lambda.zip
+  discard-paths: yes

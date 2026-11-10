@@ -1,6 +1,6 @@
 // Minimal service worker: makes the app installable and keeps the shell available on flaky connections.
 // API calls always go to the network.
-const CACHE = 'timeclock-v2';
+const CACHE = 'timeclock-v3';
 const SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/icon.svg', '/manifest.json'];
 
 self.addEventListener('install', (e) => e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL))));

@@ -2,9 +2,8 @@
 // When AWS sending isn't configured and NODE_ENV !== 'production', codes are logged
 // to the console instead (and returned to the client) so you can develop locally.
 const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
-const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 
-const region = process.env.AWS_REGION || 'us-east-1';
+const region = process.env.AWS_REGION || 'us-east-2';
 const FROM_EMAIL = process.env.SES_FROM_EMAIL;
 const SMS_ENABLED = process.env.SNS_SMS_ENABLED === 'true';
 const APP_NAME = process.env.APP_NAME || 'TimeClock';
@@ -34,6 +33,8 @@ async function sendCode(kind, target, code) {
   }
 
   if (kind === 'phone' && SMS_ENABLED) {
+    // Loaded lazily: SMS is optional (the AWS SDK ships with the Lambda Node.js runtime).
+    const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
     sns ||= new SNSClient({ region });
     await sns.send(
       new PublishCommand({

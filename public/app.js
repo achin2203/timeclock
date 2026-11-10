@@ -146,9 +146,9 @@
       if (!state.orgId) return renderSetup();
       if (!state.org) await loadOrg();
 
-      const m = hash.match(/^\/team\/(\d+)$/);
+      const m = hash.match(/^\/team\/([\w-]+)$/);
       if (hash === '/team' && state.isAdmin) return await renderTeam();
-      if (m && state.isAdmin) return await renderMember(Number(m[1]));
+      if (m && state.isAdmin) return await renderMember(m[1]);
       if (hash === '/history') return await renderHistory();
       if (hash === '/settings') return renderSettings();
       if (hash === '/new-org') return renderSetup(true);
@@ -179,7 +179,7 @@
       else throw e;
     }
     if (!state.me) return;
-    const saved = Number(store.get('orgId'));
+    const saved = store.get('orgId');
     const orgs = state.me.orgs;
     state.orgId = orgs.find((o) => o.id === saved)?.id || orgs[0]?.id || null;
   }
@@ -406,7 +406,7 @@
           )
           .join('')}</div>`,
         (el, close) =>
-          $$('[data-org]', el).forEach((b) => (b.onclick = () => (close(), switchOrg(Number(b.dataset.org)))))
+          $$('[data-org]', el).forEach((b) => (b.onclick = () => (close(), switchOrg(b.dataset.org))))
       )
     );
   }
@@ -637,10 +637,10 @@
         await rerender();
       });
     $$('[data-shift]').forEach(
-      (b) => (b.onclick = () => shiftSheet(m, s.shifts.find((x) => x.id === Number(b.dataset.shift)), () => rerender(period, 'shifts')))
+      (b) => (b.onclick = () => shiftSheet(m, s.shifts.find((x) => x.id === b.dataset.shift), () => rerender(period, 'shifts')))
     );
     $$('[data-pay]').forEach((b) => {
-      const p = s.payments.find((x) => x.id === Number(b.dataset.pay));
+      const p = s.payments.find((x) => x.id === b.dataset.pay);
       b.onclick = () =>
         sheet(
           `<h3>${money(p.amountCents)} ${methodLabel[p.method]}</h3><p class="muted">${fmtDate(p.paidAt)} ${fmtTime(p.paidAt)}${p.note ? '<br>' + esc(p.note) : ''}</p>
@@ -648,7 +648,7 @@
           (el, close) =>
             ($('#del', el).onclick = (ev) =>
               busy(ev.currentTarget, async () => {
-                await api('DELETE', `/orgs/${state.orgId}/payments/${p.id}`);
+                await api('DELETE', `/orgs/${state.orgId}/members/${m.id}/payments/${p.id}`);
                 close();
                 toast('Payment deleted');
                 rerender(period, 'payments');
@@ -754,7 +754,7 @@
           };
           await busy($('button[type=submit]', el), async () => {
             try {
-              if (x) await api('PATCH', `/orgs/${state.orgId}/shifts/${x.id}`, body);
+              if (x) await api('PATCH', `/orgs/${state.orgId}/members/${m.id}/shifts/${x.id}`, body);
               else await api('POST', `/orgs/${state.orgId}/members/${m.id}/shifts`, body);
               close();
               toast('Shift saved');
@@ -766,7 +766,7 @@
         };
         $('#del', el)?.addEventListener('click', (ev) =>
           busy(ev.currentTarget, async () => {
-            await api('DELETE', `/orgs/${state.orgId}/shifts/${x.id}`);
+            await api('DELETE', `/orgs/${state.orgId}/members/${m.id}/shifts/${x.id}`);
             close();
             toast('Shift deleted');
             after();

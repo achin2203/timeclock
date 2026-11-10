@@ -2,12 +2,14 @@ const path = require('path');
 const express = require('express');
 const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
-const { knex, migrate } = require('./db');
 const { HttpError } = require('./util');
 
+const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(__dirname, '..', 'public');
+
 function createApp() {
+  const db = require('./db');
   const app = express();
-  app.set('trust proxy', 1); // behind AWS App Runner / ALB / CloudFront
+  app.set('trust proxy', 1); // behind Lambda function URL / CloudFront
 
   app.use(
     helmet({
@@ -37,7 +39,7 @@ function createApp() {
 
   app.get('/healthz', async (req, res) => {
     try {
-      await knex.raw('select 1');
+      await db.ping();
       res.json({ ok: true });
     } catch {
       res.status(503).json({ ok: false });
@@ -49,8 +51,8 @@ function createApp() {
   app.use('/api', require('./routes/api'));
   app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
-  app.use(express.static(path.join(__dirname, '..', 'public'), { maxAge: '1h', index: 'index.html' }));
-  app.get(/^\/(?!api\/).*/, (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
+  app.use(express.static(PUBLIC_DIR, { maxAge: '1h', index: 'index.html' }));
+  app.get(/^\/(?!api\/).*/, (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
 
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, next) => {
@@ -62,14 +64,26 @@ function createApp() {
   return app;
 }
 
-if (require.main === module) {
+// Local development: `npm run dev` starts an in-memory DynamoDB (dynalite) unless DYNAMODB_ENDPOINT
+// or real AWS settings are provided.
+async function startLocal() {
+  if (!process.env.DYNAMODB_ENDPOINT && process.env.NODE_ENV !== 'production') {
+    const dynalite = require('dynalite');
+    const srv = dynalite({ createTableMs: 0 });
+    await new Promise((r) => srv.listen(0, r));
+    process.env.DYNAMODB_ENDPOINT = `http://127.0.0.1:${srv.address().port}`;
+    console.log('Using in-memory DynamoDB (data is lost on restart)');
+  }
+  await require('./db').ensureTable();
   const port = Number(process.env.PORT || 8080);
-  migrate()
-    .then(() => createApp().listen(port, () => console.log(`TimeClock listening on :${port}`)))
-    .catch((e) => {
-      console.error('Startup failed', e);
-      process.exit(1);
-    });
+  createApp().listen(port, () => console.log(`TimeClock listening on http://localhost:${port}`));
+}
+
+if (require.main === module) {
+  startLocal().catch((e) => {
+    console.error('Startup failed', e);
+    process.exit(1);
+  });
 }
 
 module.exports = { createApp };

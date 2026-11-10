@@ -1,7 +1,7 @@
 // Organisation, employee, clock, shift and payment endpoints.
 const express = require('express');
-const { knex } = require('../db');
-const { requireUser, claimInvites } = require('../auth');
+const db = require('../db');
+const { requireUser } = require('../auth');
 const {
   HttpError,
   bad,
@@ -21,111 +21,90 @@ router.use(requireUser);
 const ADMIN_ROLES = ['owner', 'admin'];
 const isAdmin = (m) => ADMIN_ROLES.includes(m.role);
 const DAY = 86400000;
+const clip = (v, n) => (v === undefined || v === null || v === '' ? undefined : String(v).slice(0, n));
 
 // ---------- serialisers ----------
 const orgOut = (o) => ({ id: o.id, name: o.name, timezone: o.timezone, currency: o.currency });
 const memberOut = (m) => ({
   id: m.id,
-  name: m.display_name,
-  email: m.invite_email,
-  phone: m.invite_phone,
+  name: m.displayName,
+  email: m.inviteEmail || null,
+  phone: m.invitePhone || null,
   role: m.role,
-  hourlyRateCents: m.hourly_rate_cents,
+  hourlyRateCents: m.hourlyRateCents,
   active: !!m.active,
-  linked: !!m.user_id,
+  linked: !!m.userId,
 });
 const shiftOut = (s, now = Date.now()) => ({
   id: s.id,
-  memberId: s.member_id,
-  clockIn: s.clock_in,
-  clockOut: s.clock_out,
-  rateCents: s.rate_cents,
-  minutes: Math.round(((s.clock_out || now) - s.clock_in) / 60000),
-  wageCents: wageCents(s.rate_cents, s.clock_in, s.clock_out || now),
-  open: !s.clock_out,
-  note: s.note,
+  memberId: s.memberId,
+  clockIn: s.clockIn,
+  clockOut: s.clockOut || null,
+  rateCents: s.rateCents,
+  minutes: Math.round(((s.clockOut || now) - s.clockIn) / 60000),
+  wageCents: wageCents(s.rateCents, s.clockIn, s.clockOut || now),
+  open: !s.clockOut,
+  note: s.note || null,
 });
 const paymentOut = (p) => ({
   id: p.id,
-  memberId: p.member_id,
-  amountCents: p.amount_cents,
+  memberId: p.memberId,
+  amountCents: p.amountCents,
   method: p.method,
-  paidAt: p.paid_at,
-  note: p.note,
+  paidAt: p.paidAt,
+  note: p.note || null,
 });
 
-// Per-shift rounded wage, summed in SQL (works in Postgres and SQLite).
-const EARNED_SQL = 'COALESCE(SUM(ROUND(rate_cents * (clock_out - clock_in) / 3600000.0)), 0)';
-
-async function balances(orgId, memberIds) {
-  if (!memberIds.length) return {};
-  const earned = await knex('shifts')
-    .select('member_id')
-    .select(knex.raw(`${EARNED_SQL} as earned`))
-    .where({ org_id: orgId })
-    .whereIn('member_id', memberIds)
-    .whereNotNull('clock_out')
-    .groupBy('member_id');
-  const paid = await knex('payments')
-    .select('member_id')
-    .sum({ paid: 'amount_cents' })
-    .where({ org_id: orgId })
-    .whereIn('member_id', memberIds)
-    .groupBy('member_id');
-  const out = {};
-  for (const id of memberIds) out[id] = { earnedCents: 0, paidCents: 0, balanceCents: 0 };
-  for (const r of earned) out[r.member_id].earnedCents = Number(r.earned);
-  for (const r of paid) out[r.member_id].paidCents = Number(r.paid);
-  for (const id of memberIds) out[id].balanceCents = out[id].earnedCents - out[id].paidCents;
-  return out;
+// All-time balance: wages from completed shifts minus payments.
+function balanceOf({ shifts, payments }) {
+  const earnedCents = shifts.filter((s) => s.clockOut).reduce((a, s) => a + wageCents(s.rateCents, s.clockIn, s.clockOut), 0);
+  const paidCents = payments.reduce((a, p) => a + p.amountCents, 0);
+  return { earnedCents, paidCents, balanceCents: earnedCents - paidCents };
 }
 
 // ---------- org access middleware ----------
 const loadOrg = asyncH(async (req, res, next) => {
-  const orgId = Number(req.params.orgId);
-  const me = await knex('members').where({ org_id: orgId, user_id: req.user.id, active: true }).first();
-  if (!me) throw new HttpError(404, 'Organization not found');
+  const orgId = String(req.params.orgId);
+  const me = await db.membershipFor(req.user.id, orgId);
+  if (!me || !me.active) throw new HttpError(404, 'Organization not found');
+  const org = await db.getOrg(orgId);
+  if (!org) throw new HttpError(404, 'Organization not found');
   req.me = me;
-  req.org = await knex('organizations').where({ id: orgId }).first();
+  req.org = org;
   next();
 });
 const requireAdmin = (req, res, next) => (isAdmin(req.me) ? next() : next(new HttpError(403, 'Admins only')));
 
 async function getMember(req, id) {
-  const m = await knex('members').where({ id: Number(id), org_id: req.org.id }).first();
+  const m = await db.getMember(req.org.id, String(id));
   if (!m) throw new HttpError(404, 'Employee not found');
   return m;
 }
 
 // Self, or an admin acting on someone in the same org.
 async function resolveTarget(req, memberId) {
-  if (!memberId || Number(memberId) === req.me.id) return req.me;
+  if (!memberId || memberId === 'me' || String(memberId) === req.me.id) return req.me;
   if (!isAdmin(req.me)) throw new HttpError(403, 'Admins only');
   return getMember(req, memberId);
 }
 
-async function assertNoOverlap(memberId, start, end, excludeId) {
-  const q = knex('shifts')
-    .where({ member_id: memberId })
-    .andWhere((w) => w.whereNull('clock_out').orWhere('clock_out', '>', start));
-  if (end) q.andWhere('clock_in', '<', end);
-  if (excludeId) q.andWhereNot('id', excludeId);
-  if (await q.first()) throw new HttpError(409, 'This overlaps another shift for the same employee');
+function assertNoOverlap(shifts, start, end, excludeId) {
+  const hit = shifts.find(
+    (s) => s.id !== excludeId && (s.clockOut ? s.clockOut > start : true) && (end ? s.clockIn < end : true)
+  );
+  if (hit) throw new HttpError(409, 'This overlaps another shift for the same employee');
 }
 
 // ---------- me ----------
 router.get(
   '/me',
   asyncH(async (req, res) => {
-    await claimInvites(req.user);
-    const orgs = await knex('members as m')
-      .join('organizations as o', 'o.id', 'm.org_id')
-      .where({ 'm.user_id': req.user.id, 'm.active': true })
-      .select('o.id', 'o.name', 'm.role', 'm.id as member_id')
-      .orderBy('o.name');
+    await db.claimInvites(req.user);
+    const orgs = await db.userOrgs(req.user.id);
+    const u = req.user;
     res.json({
-      user: { id: req.user.id, name: req.user.name, email: req.user.email, phone: req.user.phone },
-      orgs: orgs.map((o) => ({ id: o.id, name: o.name, role: o.role, memberId: o.member_id })),
+      user: { id: u.id, name: u.name || null, email: u.email || null, phone: u.phone || null },
+      orgs,
     });
   })
 );
@@ -135,7 +114,7 @@ router.patch(
   asyncH(async (req, res) => {
     const name = String(req.body?.name || '').trim().slice(0, 120);
     if (!name) throw bad('Name is required');
-    await knex('users').where({ id: req.user.id }).update({ name });
+    await db.updateUser(req.user.id, { name });
     res.json({ ok: true });
   })
 );
@@ -149,27 +128,19 @@ router.post(
     const currency = String(req.body?.currency || 'USD').toUpperCase().slice(0, 3);
     if (!name) throw bad('Organization name is required');
     if (!validTimezone(timezone)) throw bad('Invalid time zone');
-    const now = Date.now();
-    const orgId = await knex.transaction(async (trx) => {
-      const [o] = await trx('organizations').insert({ name, timezone, currency, created_at: now }).returning('id');
-      const id = o.id ?? o;
-      await trx('members').insert({
-        org_id: id,
-        user_id: req.user.id,
-        display_name: req.user.name || req.body?.yourName || req.user.email || req.user.phone || 'Owner',
-        invite_email: req.user.email,
-        invite_phone: req.user.phone,
-        role: 'owner',
-        hourly_rate_cents: req.body?.yourHourlyRate ? toCents(req.body.yourHourlyRate, 'hourly rate') : 0,
-        active: true,
-        created_at: now,
-      });
-      return id;
+    const yourName = clip(String(req.body?.yourName || '').trim(), 120);
+    if (yourName && !req.user.name) await db.updateUser(req.user.id, { name: yourName });
+
+    const org = await db.createOrg({ name, timezone, currency });
+    await db.createMember(org.id, {
+      userId: req.user.id,
+      displayName: req.user.name || yourName || req.user.email || req.user.phone || 'Owner',
+      inviteEmail: req.user.email,
+      invitePhone: req.user.phone,
+      role: 'owner',
+      hourlyRateCents: req.body?.yourHourlyRate ? toCents(req.body.yourHourlyRate, 'hourly rate') : 0,
     });
-    if (req.body?.yourName && !req.user.name) {
-      await knex('users').where({ id: req.user.id }).update({ name: String(req.body.yourName).slice(0, 120) });
-    }
-    res.status(201).json({ id: orgId });
+    res.status(201).json({ id: org.id });
   })
 );
 
@@ -196,7 +167,7 @@ router.patch(
       patch.timezone = req.body.timezone;
     }
     if (req.body.currency !== undefined) patch.currency = String(req.body.currency).toUpperCase().slice(0, 3);
-    if (Object.keys(patch).length) await knex('organizations').where({ id: req.org.id }).update(patch);
+    if (Object.keys(patch).length) await db.updateOrg(req.org.id, patch);
     res.json({ ok: true });
   })
 );
@@ -207,18 +178,32 @@ router.get(
   loadOrg,
   requireAdmin,
   asyncH(async (req, res) => {
-    const members = await knex('members').where({ org_id: req.org.id }).orderBy([{ column: 'active', order: 'desc' }, 'display_name']);
-    const ids = members.map((m) => m.id);
-    const bal = await balances(req.org.id, ids);
-    const open = ids.length
-      ? await knex('shifts').where({ org_id: req.org.id }).whereNull('clock_out').whereIn('member_id', ids)
-      : [];
-    const openBy = Object.fromEntries(open.map((s) => [s.member_id, shiftOut(s)]));
-    res.json({
-      members: members.map((m) => ({ ...memberOut(m), ...bal[m.id], openShift: openBy[m.id] || null })),
-    });
+    const members = await db.listMembers(req.org.id);
+    const now = Date.now();
+    const rows = await Promise.all(
+      members.map(async (m) => {
+        const rec = await db.memberRecords(m.id);
+        const open = rec.shifts.find((s) => !s.clockOut);
+        return { ...memberOut(m), ...balanceOf(rec), openShift: open ? shiftOut(open, now) : null };
+      })
+    );
+    rows.sort((a, b) => Number(b.active) - Number(a.active) || a.name.localeCompare(b.name));
+    res.json({ members: rows });
   })
 );
+
+async function assertContactFree(orgId, email, phone, selfId) {
+  for (const [kind, value] of [
+    ['email', email],
+    ['phone', phone],
+  ]) {
+    const inv = await db.inviteOwner(orgId, kind, value);
+    if (inv && inv.memberId !== selfId) {
+      const other = await db.getMember(orgId, inv.memberId);
+      throw new HttpError(409, `${other?.displayName || 'Another employee'} already uses that ${kind}`);
+    }
+  }
+}
 
 router.post(
   '/orgs/:orgId/members',
@@ -233,41 +218,20 @@ router.post(
     if (b.email && !email) throw bad('Invalid email address');
     if (b.phone && !phone) throw bad('Invalid phone number');
     if (!email && !phone) throw bad('Add an email or phone number so they can sign in');
-    const role = b.role === 'admin' ? 'admin' : 'employee';
+    await assertContactFree(req.org.id, email, phone);
 
-    const dup = await knex('members')
-      .where({ org_id: req.org.id })
-      .andWhere((q) => {
-        if (email) q.orWhere('invite_email', email);
-        if (phone) q.orWhere('invite_phone', phone);
-      })
-      .first();
-    if (dup) throw new HttpError(409, `${dup.display_name} already uses that email or phone`);
+    // If they already have an account (and aren't already in this org), link it right away.
+    const existing = (await db.findUserByIdent('email', email)) || (await db.findUserByIdent('phone', phone));
+    const alreadyIn = existing && (await db.membershipFor(existing.id, req.org.id));
 
-    // If they already have an account, link it right away.
-    const existing = await knex('users')
-      .where((q) => {
-        if (email) q.orWhere('email', email);
-        if (phone) q.orWhere('phone', phone);
-      })
-      .first();
-    const linkedElsewhere =
-      existing && (await knex('members').where({ org_id: req.org.id, user_id: existing.id }).first());
-
-    const [row] = await knex('members')
-      .insert({
-        org_id: req.org.id,
-        user_id: existing && !linkedElsewhere ? existing.id : null,
-        display_name: name,
-        invite_email: email,
-        invite_phone: phone,
-        role,
-        hourly_rate_cents: toCents(b.hourlyRate ?? 0, 'hourly rate'),
-        active: true,
-        created_at: Date.now(),
-      })
-      .returning('id');
-    const m = await getMember(req, row.id ?? row);
+    const m = await db.createMember(req.org.id, {
+      userId: existing && !alreadyIn ? existing.id : undefined,
+      displayName: name,
+      inviteEmail: email || undefined,
+      invitePhone: phone || undefined,
+      role: b.role === 'admin' ? 'admin' : 'employee',
+      hourlyRateCents: toCents(b.hourlyRate ?? 0, 'hourly rate'),
+    });
     res.status(201).json({ member: memberOut(m) });
   })
 );
@@ -280,28 +244,54 @@ router.patch(
     const m = await getMember(req, req.params.memberId);
     const b = req.body || {};
     const patch = {};
+    const remove = [];
     if (b.name !== undefined) {
-      patch.display_name = String(b.name).trim().slice(0, 120);
-      if (!patch.display_name) throw bad('Name is required');
+      patch.displayName = String(b.name).trim().slice(0, 120);
+      if (!patch.displayName) throw bad('Name is required');
     }
-    if (b.hourlyRate !== undefined) patch.hourly_rate_cents = toCents(b.hourlyRate, 'hourly rate');
+    if (b.hourlyRate !== undefined) patch.hourlyRateCents = toCents(b.hourlyRate, 'hourly rate');
+
+    let email = m.inviteEmail || null;
+    let phone = m.invitePhone || null;
     if (b.email !== undefined) {
-      patch.invite_email = b.email ? normEmail(b.email) : null;
-      if (b.email && !patch.invite_email) throw bad('Invalid email address');
+      email = b.email ? normEmail(b.email) : null;
+      if (b.email && !email) throw bad('Invalid email address');
     }
     if (b.phone !== undefined) {
-      patch.invite_phone = b.phone ? normPhone(b.phone) : null;
-      if (b.phone && !patch.invite_phone) throw bad('Invalid phone number');
+      phone = b.phone ? normPhone(b.phone) : null;
+      if (b.phone && !phone) throw bad('Invalid phone number');
     }
+    if (!email && !phone) throw bad('Keep an email or phone number so they can sign in');
+    await assertContactFree(req.org.id, email, phone, m.id);
+
     if (b.role !== undefined || b.active !== undefined) {
       if (m.role === 'owner') throw bad("The owner's role can't be changed");
       if (b.role !== undefined) patch.role = b.role === 'admin' ? 'admin' : 'employee';
       if (b.active !== undefined) patch.active = !!b.active;
     }
-    if (Object.keys(patch).length) await knex('members').where({ id: m.id }).update(patch);
+    if (email !== (m.inviteEmail || null)) {
+      await db.deleteInvite(req.org.id, 'email', m.inviteEmail);
+      await db.putInvite(req.org.id, 'email', email, m.id);
+      if (email) patch.inviteEmail = email;
+      else remove.push('inviteEmail');
+    }
+    if (phone !== (m.invitePhone || null)) {
+      await db.deleteInvite(req.org.id, 'phone', m.invitePhone);
+      await db.putInvite(req.org.id, 'phone', phone, m.id);
+      if (phone) patch.invitePhone = phone;
+      else remove.push('invitePhone');
+    }
+    await db.updateMember(req.org.id, m.id, patch, remove);
+
     // Optionally re-price the shift currently in progress at the new rate.
-    if (patch.hourly_rate_cents !== undefined && b.applyToOpenShift) {
-      await knex('shifts').where({ member_id: m.id }).whereNull('clock_out').update({ rate_cents: patch.hourly_rate_cents });
+    if (patch.hourlyRateCents !== undefined && b.applyToOpenShift && m.openShiftId) {
+      const s = await db.getShift(m.id, m.openShiftId);
+      if (s && !s.clockOut) await db.putShift({ ...s, rateCents: patch.hourlyRateCents });
+    }
+    // New contact details may match someone who already has an account.
+    if (!m.userId) {
+      const existing = (await db.findUserByIdent('email', email)) || (await db.findUserByIdent('phone', phone));
+      if (existing && !(await db.membershipFor(existing.id, req.org.id))) await db.linkMember(req.org.id, m.id, existing.id);
     }
     res.json({ member: memberOut(await getMember(req, m.id)) });
   })
@@ -312,30 +302,23 @@ router.get(
   '/orgs/:orgId/members/:memberId/summary',
   loadOrg,
   asyncH(async (req, res) => {
-    const m = await resolveTarget(req, req.params.memberId === 'me' ? req.me.id : req.params.memberId);
+    const m = await resolveTarget(req, req.params.memberId);
     const now = Date.now();
     const to = toMs(req.query.to, 'to') ?? now + DAY;
     const from = toMs(req.query.from, 'from') ?? now - 30 * DAY;
     const tz = req.org.timezone;
 
-    const shifts = await knex('shifts')
-      .where({ member_id: m.id })
-      .andWhere('clock_in', '>=', from)
-      .andWhere('clock_in', '<', to)
-      .orderBy('clock_in', 'desc');
-    const openShift = await knex('shifts').where({ member_id: m.id }).whereNull('clock_out').first();
-    const payments = await knex('payments')
-      .where({ member_id: m.id })
-      .andWhere('paid_at', '>=', from)
-      .andWhere('paid_at', '<', to)
-      .orderBy('paid_at', 'desc');
+    const rec = await db.memberRecords(m.id);
+    const shifts = rec.shifts.filter((s) => s.clockIn >= from && s.clockIn < to);
+    const payments = rec.payments.filter((p) => p.paidAt >= from && p.paidAt < to);
+    const openShift = rec.shifts.find((s) => !s.clockOut);
 
     // Daily totals in the organisation's time zone (a shift counts toward the day it started).
     const days = {};
     let periodEarned = 0;
     for (const s of shifts) {
       const o = shiftOut(s, now);
-      const d = localDate(s.clock_in, tz);
+      const d = localDate(s.clockIn, tz);
       days[d] ||= { date: d, minutes: 0, wageCents: 0, shifts: 0, inProgress: false };
       days[d].minutes += o.minutes;
       days[d].wageCents += o.wageCents;
@@ -343,15 +326,13 @@ router.get(
       if (o.open) days[d].inProgress = true;
       else periodEarned += o.wageCents;
     }
-    const periodPaid = payments.reduce((a, p) => a + p.amount_cents, 0);
-    const bal = (await balances(req.org.id, [m.id]))[m.id];
 
     res.json({
       member: memberOut(m),
       today: localDate(now, tz),
       openShift: openShift ? shiftOut(openShift, now) : null,
-      balance: bal, // all-time: completed shifts minus payments
-      period: { from, to, earnedCents: periodEarned, paidCents: periodPaid },
+      balance: balanceOf(rec),
+      period: { from, to, earnedCents: periodEarned, paidCents: payments.reduce((a, p) => a + p.amountCents, 0) },
       days: Object.values(days).sort((a, b) => (a.date < b.date ? 1 : -1)),
       shifts: shifts.map((s) => shiftOut(s, now)),
       payments: payments.map(paymentOut),
@@ -366,23 +347,9 @@ router.post(
   asyncH(async (req, res) => {
     const m = await resolveTarget(req, req.body?.memberId);
     if (!m.active) throw bad('This employee is inactive');
-    const now = Date.now();
-    try {
-      await knex('shifts').insert({
-        org_id: req.org.id,
-        member_id: m.id,
-        clock_in: now,
-        clock_out: null,
-        rate_cents: m.hourly_rate_cents,
-        note: req.body?.note ? String(req.body.note).slice(0, 500) : null,
-        created_at: now,
-      });
-    } catch (e) {
-      if (/unique|constraint/i.test(e.message)) throw new HttpError(409, 'Already clocked in');
-      throw e;
-    }
-    const open = await knex('shifts').where({ member_id: m.id }).whereNull('clock_out').first();
-    res.status(201).json({ shift: shiftOut(open) });
+    const s = await db.clockIn(m, clip(req.body?.note, 500));
+    if (!s) throw new HttpError(409, 'Already clocked in');
+    res.status(201).json({ shift: shiftOut(s) });
   })
 );
 
@@ -391,11 +358,9 @@ router.post(
   loadOrg,
   asyncH(async (req, res) => {
     const m = await resolveTarget(req, req.body?.memberId);
-    const open = await knex('shifts').where({ member_id: m.id }).whereNull('clock_out').first();
-    if (!open) throw new HttpError(409, 'Not clocked in');
-    const now = Math.max(Date.now(), open.clock_in + 1000);
-    await knex('shifts').where({ id: open.id }).whereNull('clock_out').update({ clock_out: now });
-    res.json({ shift: shiftOut({ ...open, clock_out: now }) });
+    const s = await db.clockOut(m);
+    if (!s) throw new HttpError(409, 'Not clocked in');
+    res.json({ shift: shiftOut(s) });
   })
 );
 
@@ -411,59 +376,64 @@ router.post(
     if (!start || !end) throw bad('Clock-in and clock-out times are required');
     if (end <= start) throw bad('Clock-out must be after clock-in');
     if (end > Date.now() + 60000) throw bad("Clock-out can't be in the future");
-    await assertNoOverlap(m.id, start, end);
-    const rate = req.body?.hourlyRate !== undefined ? toCents(req.body.hourlyRate, 'hourly rate') : m.hourly_rate_cents;
-    const [row] = await knex('shifts')
-      .insert({
-        org_id: req.org.id,
-        member_id: m.id,
-        clock_in: start,
-        clock_out: end,
-        rate_cents: rate,
-        note: req.body?.note ? String(req.body.note).slice(0, 500) : 'Added manually',
-        edited_by: req.user.id,
-        created_at: Date.now(),
-      })
-      .returning('id');
-    const s = await knex('shifts').where({ id: row.id ?? row }).first();
+    const { shifts } = await db.memberRecords(m.id);
+    assertNoOverlap(shifts, start, end);
+    const s = {
+      id: db.newId(),
+      orgId: req.org.id,
+      memberId: m.id,
+      clockIn: start,
+      clockOut: end,
+      rateCents: req.body?.hourlyRate !== undefined ? toCents(req.body.hourlyRate, 'hourly rate') : m.hourlyRateCents,
+      note: clip(req.body?.note, 500) || 'Added manually',
+      editedBy: req.user.id,
+      createdAt: Date.now(),
+    };
+    await db.putShift(s);
     res.status(201).json({ shift: shiftOut(s) });
   })
 );
 
 router.patch(
-  '/orgs/:orgId/shifts/:shiftId',
+  '/orgs/:orgId/members/:memberId/shifts/:shiftId',
   loadOrg,
   requireAdmin,
   asyncH(async (req, res) => {
-    const s = await knex('shifts').where({ id: Number(req.params.shiftId), org_id: req.org.id }).first();
+    const m = await getMember(req, req.params.memberId);
+    const s = await db.getShift(m.id, String(req.params.shiftId));
     if (!s) throw new HttpError(404, 'Shift not found');
+    const isOpen = !s.clockOut;
     const b = req.body || {};
-    const start = b.clockIn !== undefined ? toMs(b.clockIn, 'clock-in time') : s.clock_in;
-    const end = b.clockOut !== undefined ? toMs(b.clockOut, 'clock-out time') : s.clock_out;
+    const start = b.clockIn !== undefined ? toMs(b.clockIn, 'clock-in time') : s.clockIn;
+    let end = b.clockOut !== undefined ? toMs(b.clockOut, 'clock-out time') : s.clockOut || null;
     if (!start) throw bad('Clock-in time is required');
+    if (!isOpen && !end) throw bad('Clock-out time is required');
     if (end && end <= start) throw bad('Clock-out must be after clock-in');
     if (end && end > Date.now() + 60000) throw bad("Clock-out can't be in the future");
-    await assertNoOverlap(s.member_id, start, end, s.id);
-    const patch = { clock_in: start, clock_out: end || null, edited_by: req.user.id };
-    if (b.hourlyRate !== undefined) patch.rate_cents = toCents(b.hourlyRate, 'hourly rate');
-    if (b.note !== undefined) patch.note = b.note ? String(b.note).slice(0, 500) : null;
-    try {
-      await knex('shifts').where({ id: s.id }).update(patch);
-    } catch (e) {
-      if (/unique|constraint/i.test(e.message)) throw new HttpError(409, 'Employee already has an open shift');
-      throw e;
-    }
-    res.json({ shift: shiftOut(await knex('shifts').where({ id: s.id }).first()) });
+    if (isOpen && start > Date.now() + 60000) throw bad("Clock-in can't be in the future");
+    const { shifts } = await db.memberRecords(m.id);
+    assertNoOverlap(shifts, start, end, s.id);
+
+    const next = { ...s, clockIn: start, editedBy: req.user.id };
+    if (end) next.clockOut = end;
+    if (b.hourlyRate !== undefined) next.rateCents = toCents(b.hourlyRate, 'hourly rate');
+    if (b.note !== undefined) next.note = clip(b.note, 500);
+    await db.putShift(next);
+    if (isOpen && end && m.openShiftId === s.id) await db.updateMember(req.org.id, m.id, {}, ['openShiftId']);
+    res.json({ shift: shiftOut(next) });
   })
 );
 
 router.delete(
-  '/orgs/:orgId/shifts/:shiftId',
+  '/orgs/:orgId/members/:memberId/shifts/:shiftId',
   loadOrg,
   requireAdmin,
   asyncH(async (req, res) => {
-    const n = await knex('shifts').where({ id: Number(req.params.shiftId), org_id: req.org.id }).del();
-    if (!n) throw new HttpError(404, 'Shift not found');
+    const m = await getMember(req, req.params.memberId);
+    const s = await db.getShift(m.id, String(req.params.shiftId));
+    if (!s) throw new HttpError(404, 'Shift not found');
+    await db.deleteShift(m.id, s.id);
+    if (m.openShiftId === s.id) await db.updateMember(req.org.id, m.id, {}, ['openShiftId']);
     res.json({ ok: true });
   })
 );
@@ -478,32 +448,31 @@ router.post(
     const amount = toCents(req.body?.amount, 'amount');
     if (amount <= 0) throw bad('Amount must be more than zero');
     const method = ['cash', 'bank', 'check', 'other'].includes(req.body?.method) ? req.body.method : 'cash';
-    const paidAt = toMs(req.body?.paidAt, 'payment date') ?? Date.now();
-    const [row] = await knex('payments')
-      .insert({
-        org_id: req.org.id,
-        member_id: m.id,
-        amount_cents: amount,
-        method,
-        paid_at: paidAt,
-        note: req.body?.note ? String(req.body.note).slice(0, 500) : null,
-        recorded_by: req.user.id,
-        created_at: Date.now(),
-      })
-      .returning('id');
-    const p = await knex('payments').where({ id: row.id ?? row }).first();
-    const bal = (await balances(req.org.id, [m.id]))[m.id];
-    res.status(201).json({ payment: paymentOut(p), balance: bal });
+    const p = {
+      id: db.newId(),
+      orgId: req.org.id,
+      memberId: m.id,
+      amountCents: amount,
+      method,
+      paidAt: toMs(req.body?.paidAt, 'payment date') ?? Date.now(),
+      note: clip(req.body?.note, 500),
+      recordedBy: req.user.id,
+      createdAt: Date.now(),
+    };
+    await db.putPayment(p);
+    res.status(201).json({ payment: paymentOut(p), balance: balanceOf(await db.memberRecords(m.id)) });
   })
 );
 
 router.delete(
-  '/orgs/:orgId/payments/:paymentId',
+  '/orgs/:orgId/members/:memberId/payments/:paymentId',
   loadOrg,
   requireAdmin,
   asyncH(async (req, res) => {
-    const n = await knex('payments').where({ id: Number(req.params.paymentId), org_id: req.org.id }).del();
-    if (!n) throw new HttpError(404, 'Payment not found');
+    const m = await getMember(req, req.params.memberId);
+    const p = await db.getPayment(m.id, String(req.params.paymentId));
+    if (!p) throw new HttpError(404, 'Payment not found');
+    await db.deletePayment(m.id, p.id);
     res.json({ ok: true });
   })
 );
@@ -518,36 +487,36 @@ router.get(
     const to = toMs(req.query.to, 'to') ?? now + DAY;
     const from = toMs(req.query.from, 'from') ?? now - 31 * DAY;
     const tz = req.org.timezone;
-    const rows = await knex('shifts as s')
-      .join('members as m', 'm.id', 's.member_id')
-      .where('s.org_id', req.org.id)
-      .andWhere('s.clock_in', '>=', from)
-      .andWhere('s.clock_in', '<', to)
-      .select('s.*', 'm.display_name')
-      .orderBy([{ column: 'm.display_name' }, { column: 's.clock_in' }]);
+    const members = (await db.listMembers(req.org.id)).sort((a, b) => a.displayName.localeCompare(b.displayName));
     const fmt = (ms) =>
       ms
         ? new Intl.DateTimeFormat('en-US', { timeZone: tz, dateStyle: 'short', timeStyle: 'short' }).format(new Date(ms))
         : '';
     const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
     const lines = [['Date', 'Employee', 'Clock in', 'Clock out', 'Hours', 'Rate', 'Wage', 'Note'].join(',')];
-    for (const r of rows) {
-      const o = shiftOut(r, now);
-      lines.push(
-        [
-          localDate(r.clock_in, tz),
-          esc(r.display_name),
-          esc(fmt(r.clock_in)),
-          esc(r.clock_out ? fmt(r.clock_out) : 'in progress'),
-          (o.minutes / 60).toFixed(2),
-          (r.rate_cents / 100).toFixed(2),
-          (o.wageCents / 100).toFixed(2),
-          esc(r.note),
-        ].join(',')
-      );
+    for (const m of members) {
+      const { shifts } = await db.memberRecords(m.id);
+      for (const r of shifts.filter((s) => s.clockIn >= from && s.clockIn < to).sort((a, b) => a.clockIn - b.clockIn)) {
+        const o = shiftOut(r, now);
+        lines.push(
+          [
+            localDate(r.clockIn, tz),
+            esc(m.displayName),
+            esc(fmt(r.clockIn)),
+            esc(r.clockOut ? fmt(r.clockOut) : 'in progress'),
+            (o.minutes / 60).toFixed(2),
+            (r.rateCents / 100).toFixed(2),
+            (o.wageCents / 100).toFixed(2),
+            esc(r.note),
+          ].join(',')
+        );
+      }
     }
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="timesheet-${localDate(from, tz)}-to-${localDate(to - 1, tz)}.csv"`);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="timesheet-${localDate(from, tz)}-to-${localDate(to - 1, tz)}.csv"`
+    );
     res.send(lines.join('\n'));
   })
 );

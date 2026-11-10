@@ -2,7 +2,7 @@
 
 A mobile-first web app for clocking employees in and out, working out daily wages from an hourly rate, recording cash payments, and showing what each employee is still owed.
 
-It runs in any phone browser and can be added to the home screen like an app. One Docker image holds the whole thing, and it runs on AWS App Runner with Amazon RDS (PostgreSQL).
+It runs in any phone browser and can be added to the home screen like an app. It runs on **AWS Lambda + Amazon DynamoDB**, so you pay only for actual use; a small team typically costs a few dollars a month or less.
 
 ## What it does
 
@@ -36,70 +36,60 @@ It runs in any phone browser and can be added to the home screen like an app. On
 
 ```bash
 npm install
-npm run dev          # http://localhost:8080 — uses a local SQLite file
+npm run dev          # http://localhost:8080 — uses an in-memory DynamoDB (data resets on restart)
 npm test             # end-to-end API tests
 ```
 
-With no email or SMS service set up, development mode **shows the 6-digit login code on screen** and prints it to the console, so you can sign in with any phone number or email.
+With no email service set up, development mode **shows the 6-digit login code on screen** and prints it to the console, so you can sign in with any phone number or email.
 
-To run against Postgres the way production does: `docker compose up --build`
-
-## Deploy to AWS
-
-Recommended setup:
+## How it runs on AWS
 
 ```
-Phone browser ──HTTPS──▶ AWS App Runner (this container, auto-scaling, free TLS)
-                              │  VPC connector
-                              ▼
-                       Amazon RDS for PostgreSQL (private)
-                       Amazon SES (email codes) · Amazon SNS (SMS codes)
+Phone browser ──HTTPS──▶ Lambda function URL ──▶ AWS Lambda (Node.js 22, this app)
+                                                   ├─▶ Amazon DynamoDB table "timeclock" (on-demand)
+                                                   └─▶ Amazon SES (email sign-in codes)
 ```
 
-### 1. Database (RDS)
-1. In the RDS console, create a **PostgreSQL 16** database. A `db.t4g.micro` instance is plenty. Set **Public access: No** and initial database name `timeclock`.
-2. Write down the endpoint, user and password. Your connection string is:
-   `postgres://USER:PASSWORD@ENDPOINT:5432/timeclock`
+Everything is billed per request, so idle time costs nothing. Lambda, DynamoDB and SES are all billed on use.
 
-The app creates its tables automatically the first time it starts.
+| Resource | Name |
+|---|---|
+| Lambda function (with public HTTPS function URL) | `timeclock` |
+| DynamoDB table (on-demand, deletion protection, TTL on `ttl`) | `timeclock` |
+| IAM role for the function | `timeclock-lambda` |
+| CodeBuild project (builds `dist/lambda.zip` from this repo) | `timeclock-build` |
+| S3 bucket for build output | `timeclock-deploy-<account>-<region>` |
 
-### 2. Push the container image
-```bash
-AWS_REGION=us-east-1 ./deploy/push-image.sh timeclock
-```
+### Releasing an update
+1. Push to `main`.
+2. Start a build of the `timeclock-build` CodeBuild project. It runs the tests and writes `lambda.zip` to the deploy bucket.
+3. Point the `timeclock` function at the new zip (Lambda → *Upload from Amazon S3*, or `aws lambda update-function-code`).
 
-### 3. Create the App Runner service
-1. In App Runner, create a service. Source: **Container registry → Amazon ECR**, and choose `timeclock:latest`. Port: **8080**.
-2. Set the environment variables listed in `.env.example`: `NODE_ENV=production`, `DATABASE_URL`, `JWT_SECRET` (generate one with `openssl rand -hex 32`), plus your sign-in settings. Store `DATABASE_URL` and `JWT_SECRET` as **Secrets Manager** references, not plain text.
-3. **Networking → Outgoing traffic: Custom VPC.** Add a VPC connector that uses the RDS VPC's **private subnets**, then allow the connector's security group on port 5432 in the RDS security group.
-   - Once a VPC connector is attached, *all* outgoing traffic goes through your VPC. The app still has to reach SES, SNS, Google and Facebook, so those private subnets need a **NAT gateway**.
-4. **Security → Instance role:** create a role that the App Runner tasks service (`tasks.apprunner.amazonaws.com`) can assume, and attach `deploy/apprunner-instance-policy.json` to it. This allows sending through SES and SNS.
-5. Health check: HTTP path `/healthz`.
-6. Optionally add a **custom domain** under the service's *Custom domains* tab. App Runner issues the HTTPS certificate.
+You can also build locally with `./deploy/build-lambda.sh`, which creates `dist/lambda.zip`.
 
-To release an update, run `push-image.sh` again and deploy. You can also turn on automatic deployment from ECR.
+### Configuration
+Lambda environment variables are listed in `.env.example`.
 
-### 4. Sign-in setup
-- **Email (SES):** verify your sending domain or address in SES and request **production access** so you can email any address. Then set `SES_FROM_EMAIL`.
-- **SMS (SNS):** in SNS → Text messaging, request to leave the **SMS sandbox**, set a monthly spend limit, and register an origination number. US numbers need **10DLC or toll-free registration**. Then set `SNS_SMS_ENABLED=true`. Set `DEFAULT_COUNTRY_CODE` to your country code; it is `1` for US and Canada.
-- **Google:** in Google Cloud Console → APIs & Services → Credentials, create an **OAuth client ID (Web application)**. Add your App Runner URL or domain under *Authorized JavaScript origins*, then set `GOOGLE_CLIENT_ID`.
-- **Facebook:** create an app at developers.facebook.com and add *Facebook Login for Web* with your domain. Then set `FACEBOOK_APP_ID` and `FACEBOOK_APP_SECRET`.
+### Data layout
+A single DynamoDB table holds everything. Keys are `pk` / `sk`, and every read is strongly consistent, so the table needs no indexes. See the top of `src/db.js` for the item layout.
 
-When `NODE_ENV=production`, any sign-in method that isn't configured shows a clear error instead of falling back to development mode.
-
-### Budget alternative: Amazon Lightsail
-For a single small business, **Lightsail container service** (deploy the same image) plus a **Lightsail managed PostgreSQL** database costs a predictable monthly amount and needs no NAT gateway. Use the same environment variables. For SES and SNS, either give the app the credentials of an IAM user that has only the `apprunner-instance-policy.json` permissions (set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`), or use only Google sign-in.
+### Sign-in setup
+- **Email (SES):** verify a sending address or domain, then set `SES_FROM_EMAIL`. A new SES account is in the *sandbox*: it only sends to verified addresses until you request production access in the SES console.
+- **Google:** in Google Cloud Console → APIs & Services → Credentials, create an **OAuth client ID (Web application)**. Add the function URL under *Authorized JavaScript origins*, then set `GOOGLE_CLIENT_ID`.
+- **SMS:** set `SNS_SMS_ENABLED=true` only if your AWS account allows Amazon SNS SMS. Leaving the SMS sandbox and registering an origination number are also required.
 
 ## Project layout
 ```
-src/server.js        Express app, security headers, static files
-src/db.js            Postgres/SQLite connection and schema migrations
+src/server.js        Express app, security headers, static files; local dev server
+src/lambda.js        AWS Lambda entry point
+src/db.js            DynamoDB data access (single table)
 src/auth.js          OTP, Google and Facebook sign-in; session cookie
 src/routes/api.js    Organizations, employees, clock, shifts, payments, CSV
 src/notify.js        SES email and SNS SMS senders
 public/              Mobile web app (no build step), PWA manifest, service worker
-test/api.test.js     End-to-end tests (run against SQLite; also pass against Postgres)
-deploy/              ECR push script and IAM policy for App Runner
+test/api.test.js     End-to-end tests against an in-memory DynamoDB
+deploy/              Lambda packaging script
+buildspec.yml        AWS CodeBuild build steps
 ```
 
 ## Security notes

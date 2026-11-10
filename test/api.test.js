@@ -1,27 +1,21 @@
-// End-to-end API test against a temporary SQLite database.
-const os = require('os');
-const path = require('path');
-const fs = require('fs');
+// End-to-end API test against an in-memory DynamoDB (dynalite).
 const test = require('node:test');
 const assert = require('node:assert');
-
-const dbFile = path.join(os.tmpdir(), `tc-test-${process.pid}.sqlite`);
-process.env.DATABASE_URL = `sqlite:${dbFile}`;
-process.env.NODE_ENV = 'test';
-
+const dynalite = require('dynalite');
 const request = require('supertest');
-const { migrate, knex } = require('../src/db');
-const { createApp } = require('../src/server');
 
-let app;
+process.env.NODE_ENV = 'test';
+process.env.TABLE_NAME = 'timeclock-test';
+
+let app, srv;
 test.before(async () => {
-  await migrate();
-  app = createApp();
+  srv = dynalite({ createTableMs: 0 });
+  await new Promise((r) => srv.listen(0, r));
+  process.env.DYNAMODB_ENDPOINT = `http://127.0.0.1:${srv.address().port}`;
+  await require('../src/db').ensureTable();
+  app = require('../src/server').createApp();
 });
-test.after(async () => {
-  await knex.destroy();
-  fs.rmSync(dbFile, { force: true });
-});
+test.after(() => srv.close());
 
 async function login(target) {
   const agent = request.agent(app);
@@ -98,7 +92,7 @@ test('full flow: org, employee invite, clock, wages, payments, balance', async (
 
   // Rate change affects future shifts only; edit shift to 4h -> $62
   await owner.patch(`/api/orgs/${orgId}/members/${mid}`).send({ hourlyRate: 20 });
-  const ed = await owner.patch(`/api/orgs/${orgId}/shifts/${shift.body.shift.id}`).send({ clockIn: y - 4 * 3600000 });
+  const ed = await owner.patch(`/api/orgs/${orgId}/members/${mid}/shifts/${shift.body.shift.id}`).send({ clockIn: y - 4 * 3600000 });
   assert.equal(ed.body.shift.wageCents, 6200);
 
   // Team list shows balance
@@ -123,4 +117,56 @@ test('bad OTP is rejected and limited', async () => {
   const r = await agent.post('/api/auth/otp/verify').send({ target: 'x@example.com', code: '000000' });
   assert.equal(r.status, 400);
   assert.equal((await agent.get('/api/me')).status, 401);
+});
+
+test('admin actions: clock for others, deletes, contact edits, deactivate', async () => {
+  const owner = await login('owner2@example.com');
+  const { body } = await owner.post('/api/orgs').send({ name: 'Shop Two', timezone: 'Asia/Kolkata', currency: 'INR', yourName: 'Boss' });
+  const orgId = body.id;
+  const a = (await owner.post(`/api/orgs/${orgId}/members`).send({ name: 'Asha', email: 'asha@example.com', hourlyRate: 100 })).body.member;
+  const b = (await owner.post(`/api/orgs/${orgId}/members`).send({ name: 'Bala', email: 'bala@example.com', hourlyRate: 120 })).body.member;
+
+  // Can't give Bala Asha's email
+  assert.equal((await owner.patch(`/api/orgs/${orgId}/members/${b.id}`).send({ email: 'asha@example.com' })).status, 409);
+  // Change Bala's email, then Bala signs in with the new one and is linked
+  assert.equal((await owner.patch(`/api/orgs/${orgId}/members/${b.id}`).send({ email: 'bala.new@example.com' })).status, 200);
+  const bala = await login('bala.new@example.com');
+  assert.equal((await bala.get('/api/me')).body.orgs.length, 1);
+  const balaOld = await login('bala@example.com');
+  assert.equal((await balaOld.get('/api/me')).body.orgs.length, 0);
+
+  // Admin clocks Asha in, deletes the open shift -> she can clock in again
+  const cin = await owner.post(`/api/orgs/${orgId}/clock/in`).send({ memberId: a.id });
+  assert.equal(cin.status, 201);
+  assert.equal((await owner.delete(`/api/orgs/${orgId}/members/${a.id}/shifts/${cin.body.shift.id}`).send({})).status, 200);
+  assert.equal((await owner.post(`/api/orgs/${orgId}/clock/in`).send({ memberId: a.id })).status, 201);
+  // Admin closes her open shift by editing clock-out
+  const sum = (await owner.get(`/api/orgs/${orgId}/members/${a.id}/summary`)).body;
+  const open = sum.openShift;
+  const fixed = await owner
+    .patch(`/api/orgs/${orgId}/members/${a.id}/shifts/${open.id}`)
+    .send({ clockIn: Date.now() - 2 * 3600000, clockOut: Date.now() - 1000 });
+  assert.equal(fixed.status, 200, JSON.stringify(fixed.body));
+  assert.equal(fixed.body.shift.open, false);
+  const after = (await owner.get(`/api/orgs/${orgId}/members/${a.id}/summary`)).body;
+  assert.equal(after.openShift, null);
+  assert.ok(after.balance.earnedCents >= 19990 && after.balance.earnedCents <= 20000, String(after.balance.earnedCents));
+
+  // Payment then delete it
+  const pay = await owner.post(`/api/orgs/${orgId}/members/${a.id}/payments`).send({ amount: 50 });
+  assert.equal(pay.body.balance.paidCents, 5000);
+  assert.equal((await owner.delete(`/api/orgs/${orgId}/members/${a.id}/payments/${pay.body.payment.id}`).send({})).status, 200);
+  assert.equal((await owner.get(`/api/orgs/${orgId}/members/${a.id}/summary`)).body.balance.paidCents, 0);
+
+  // Owner can't be demoted; deactivated employee loses access
+  const ownerMember = (await owner.get(`/api/orgs/${orgId}`)).body.me;
+  assert.equal((await owner.patch(`/api/orgs/${orgId}/members/${ownerMember.id}`).send({ role: 'employee' })).status, 400);
+  await owner.patch(`/api/orgs/${orgId}/members/${b.id}`).send({ active: false });
+  assert.equal((await bala.get('/api/me')).body.orgs.length, 0);
+  assert.equal((await bala.get(`/api/orgs/${orgId}`)).status, 404);
+
+  // Wrong-org access to member records is blocked
+  const other = await login('other-owner@example.com');
+  const o2 = (await other.post('/api/orgs').send({ name: 'Other' })).body.id;
+  assert.equal((await other.get(`/api/orgs/${o2}/members/${a.id}/summary`)).status, 404);
 });
