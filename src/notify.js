@@ -32,8 +32,12 @@ async function sendCode(kind, target, code) {
     );
     } catch (e) {
       if (e?.name === 'MessageRejected' || /not verified/i.test(e?.message || '')) {
+        const masked = target.replace(/^(.).*(@.*)$/, '$1***$2');
+        console.warn(`SES rejected sign-in email to ${masked}: ${e.message}`);
         const err = new Error(
-          "We can't email a code to this address yet — email sign-in is still in AWS test mode. Use Google sign-in, or ask your manager."
+          process.env.GOOGLE_CLIENT_ID
+            ? "We can't email a sign-in code to this address yet. Use Continue with Google, or ask your manager to approve your email."
+            : "We can't email a sign-in code to this address yet. Ask your manager to approve your email address."
         );
         err.status = 503;
         throw err;
