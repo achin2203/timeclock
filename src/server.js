@@ -51,7 +51,7 @@ function createApp() {
   app.use('/api', require('./routes/api'));
   app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
-  app.use(express.static(PUBLIC_DIR, { maxAge: '1h', index: 'index.html' }));
+  app.use(express.static(PUBLIC_DIR, { maxAge: 0, index: 'index.html' })); // always revalidate (ETag) so updates show up immediately
   app.get(/^\/(?!api\/).*/, (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'index.html')));
 
   // eslint-disable-next-line no-unused-vars
