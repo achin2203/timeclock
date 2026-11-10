@@ -19,7 +19,8 @@ async function sendCode(kind, target, code) {
 
   if (kind === 'email' && FROM_EMAIL) {
     ses ||= new SESClient({ region });
-    await ses.send(
+    try {
+      await ses.send(
       new SendEmailCommand({
         Source: FROM_EMAIL,
         Destination: { ToAddresses: [target] },
@@ -29,6 +30,16 @@ async function sendCode(kind, target, code) {
         },
       })
     );
+    } catch (e) {
+      if (e?.name === 'MessageRejected' || /not verified/i.test(e?.message || '')) {
+        const err = new Error(
+          "We can't email a code to this address yet — email sign-in is still in AWS test mode. Use Google sign-in, or ask your manager."
+        );
+        err.status = 503;
+        throw err;
+      }
+      throw e;
+    }
     return { delivered: true };
   }
 
@@ -51,9 +62,13 @@ async function sendCode(kind, target, code) {
     return { delivered: false, devCode: code };
   }
 
-  const err = new Error(kind === 'email' ? 'Email sign-in is not configured' : 'SMS sign-in is not configured');
+  const err = new Error(
+    kind === 'email' ? 'Email sign-in is not set up yet' : 'Text-message codes are not available — sign in with your email address or Google'
+  );
   err.status = 503;
   throw err;
 }
 
-module.exports = { sendCode, devMode };
+const smsEnabled = () => SMS_ENABLED || devMode();
+
+module.exports = { sendCode, devMode, smsEnabled };

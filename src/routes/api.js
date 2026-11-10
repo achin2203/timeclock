@@ -2,6 +2,7 @@
 const express = require('express');
 const db = require('../db');
 const { requireUser } = require('../auth');
+const { smsEnabled } = require('../notify');
 const {
   HttpError,
   bad,
@@ -218,6 +219,7 @@ router.post(
     if (b.email && !email) throw bad('Invalid email address');
     if (b.phone && !phone) throw bad('Invalid phone number');
     if (!email && !phone) throw bad('Add an email or phone number so they can sign in');
+    if (!email && !smsEnabled()) throw bad("Add an email address — text-message sign-in isn't turned on");
     await assertContactFree(req.org.id, email, phone);
 
     // If they already have an account (and aren't already in this org), link it right away.
@@ -262,6 +264,7 @@ router.patch(
       if (b.phone && !phone) throw bad('Invalid phone number');
     }
     if (!email && !phone) throw bad('Keep an email or phone number so they can sign in');
+    if (!email && !smsEnabled()) throw bad("Keep an email address — text-message sign-in isn't turned on");
     await assertContactFree(req.org.id, email, phone, m.id);
 
     if (b.role !== undefined || b.active !== undefined) {

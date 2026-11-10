@@ -4,7 +4,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const db = require('./db');
-const { sendCode } = require('./notify');
+const { sendCode, smsEnabled } = require('./notify');
 const { HttpError, bad, classifyTarget, normEmail, asyncH } = require('./util');
 
 const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? null : 'dev-secret-change-me');
@@ -95,7 +95,7 @@ const router = express.Router();
 const otpLimiter = rateLimit({ windowMs: 15 * 60000, limit: 20, standardHeaders: true, legacyHeaders: false });
 
 router.get('/config', (req, res) => {
-  res.json({ googleClientId: GOOGLE_CLIENT_ID || null, facebookAppId: FB_APP_ID || null });
+  res.json({ googleClientId: GOOGLE_CLIENT_ID || null, facebookAppId: FB_APP_ID || null, sms: smsEnabled() });
 });
 
 router.post(

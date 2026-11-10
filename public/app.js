@@ -141,6 +141,7 @@
     $('#sheet-root').innerHTML = '';
     const hash = location.hash.replace(/^#/, '') || '/';
     try {
+      state.config ||= await api('GET', '/auth/config').catch(() => ({}));
       if (!state.me) await loadMe();
       if (!state.me) return renderLogin();
       if (!state.orgId) return renderSetup();
@@ -200,15 +201,14 @@
   // ---------- login ----------
   async function renderLogin() {
     $('#tabs').hidden = true;
-    state.config ||= await api('GET', '/auth/config').catch(() => ({}));
     app.innerHTML = `
       <img class="login-logo" src="/icon.svg" alt="" />
       <h1 class="center">TimeClock</h1>
       <p class="center muted">Clock in, clock out, get paid right.</p>
       <div class="card" id="login-card">
         <form id="f-target" novalidate>
-          <label class="field"><span>Phone number or email</span>
-            <input id="target" autocomplete="username" inputmode="email" placeholder="(919) 555-0101 or you@email.com" required />
+          <label class="field"><span>${state.config.sms ? 'Phone number or email' : 'Email address'}</span>
+            <input id="target" autocomplete="username" inputmode="email" placeholder="${state.config.sms ? '(919) 555-0101 or you@email.com' : 'you@email.com'}" required />
           </label>
           <div class="error" id="err"></div>
           <button class="btn" type="submit">Send me a code</button>
@@ -235,7 +235,7 @@
   function renderCode(r) {
     const card = $('#login-card');
     card.innerHTML = `
-      <p class="center">We sent a 6-digit code to<br /><b>${esc(r.target)}</b></p>
+      <p class="center">We sent a 6-digit code to<br /><b>${esc(r.target)}</b>${r.kind === 'email' ? '<br /><span class="muted small">Check your spam folder if it isn\'t there in a minute.</span>' : ''}</p>
       <form id="f-code" novalidate>
         <input id="code" class="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]*" placeholder="••••••" />
         ${r.devCode ? `<div class="hint">Dev mode — no email/SMS configured. Your code is <b>${esc(r.devCode)}</b></div>` : ''}
@@ -554,11 +554,11 @@
     const isOwner = m?.role === 'owner';
     sheet(
       `<h3>${m ? 'Edit employee' : 'Add employee'}</h3>
-      ${m ? '' : '<p class="muted small" style="margin:0">They sign in with this phone number or email (or a Google account with the same email).</p>'}
+      ${m ? '' : `<p class="muted small" style="margin:0">${state.config?.sms ? 'They sign in with this phone number or email (or a Google account with the same email).' : 'They sign in with this email address, or a Google account with the same email.'}</p>`}
       <form id="f-m">
         <label class="field"><span>Name</span><input name="name" required value="${esc(m?.name || '')}" autocomplete="off" /></label>
-        <label class="field"><span>Mobile number</span><input name="phone" type="tel" inputmode="tel" value="${esc(m?.phone || '')}" placeholder="(919) 555-0101" /></label>
-        <label class="field"><span>Email</span><input name="email" type="email" inputmode="email" value="${esc(m?.email || '')}" placeholder="optional" /></label>
+        <label class="field"><span>Email</span><input name="email" type="email" inputmode="email" value="${esc(m?.email || '')}" ${state.config?.sms ? 'placeholder="optional"' : 'required placeholder="name@email.com"'} /></label>
+        <label class="field"><span>Mobile number</span><input name="phone" type="tel" inputmode="tel" value="${esc(m?.phone || '')}" placeholder="${state.config?.sms ? '(919) 555-0101' : 'optional, for your records'}" /></label>
         <label class="field"><span>Hourly rate (${esc(state.org.currency)})</span><input name="hourlyRate" inputmode="decimal" value="${m ? (m.hourlyRateCents / 100).toFixed(2) : ''}" placeholder="15.00" required /></label>
         ${m?.openShift ? '<label class="row small" style="margin-top:10px"><input type="checkbox" name="applyToOpenShift" style="width:22px;min-height:22px" /> Apply new rate to the shift in progress</label>' : ''}
         ${isOwner ? '' : `<label class="field"><span>Role</span><select name="role"><option value="employee">Employee</option><option value="admin" ${m?.role === 'admin' ? 'selected' : ''}>Admin (can manage team &amp; pay)</option></select></label>`}
